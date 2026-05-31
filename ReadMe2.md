@@ -200,3 +200,36 @@ When Q64 certifies a system, you have proof that:
 5. **The entire pipeline is deterministic and reproducible** (no hidden learning, no black boxes)
 
 That's not just good telemetry. That's **mathematically accountable systems engineering.**
+
+# Q64: Universal Manifold Fidelity Validator Overview
+
+## What It Is
+
+Q64 is a mathematical primitive for detecting structural drift in 
+high-dimensional systems. It answers: **"Has this system's underlying 
+manifold geometry changed?"**
+
+This is fundamentally different from anomaly detection or forecasting.
+It's cryptographic accountability of structure.
+
+## Where It Applies
+
+| Domain | Problem | Q64 Solution |
+|--------|---------|--------------|
+| **Distributed Systems** | Silent Byzantine divergence | Detect via manifold geometry change |
+| **Cryptography** | Prove state evolution fidelity | Hash the manifold, not just bits |
+| **Physics/Engineering** | Detect measurement corruption | Validate against frozen reference |
+| **Scientific Computing** | Ensure reproducibility | Verify manifold matches across runs |
+| **Hardware Security** | Detect side-channel leaks | Information leaks as manifold divergence |
+
+## DEEQN64: The Foundation
+
+DEEQN64 (GitHub) is Week 1 reference implementation + validation.
+
+Games provide a natural test domain because:
+- High-dimensional telemetry (64 dimensions)
+- Persistent low-rank structure (physics, rendering, input)
+- Clear success criterion (convergence predicate)
+- Cross-platform validation (PC, mobile, console)
+
+Validation on games → foundation for universal platform.
