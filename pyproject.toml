@@ -1,0 +1,115 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "deeqn64"
+version = "1.0.0"
+description = "Q64 Spectral Stability Certification Engine - Real-time structural certification for complex systems"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "AGPL-3.0"}
+authors = [
+    {name = "DEEQN64 Contributors", email = "contributors@deeqn64.org"}
+]
+keywords = [
+    "spectral-analysis",
+    "stability-certification",
+    "dynamical-systems",
+    "structural-assurance",
+    "q64"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "h5py>=3.8.0",
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "flake8>=5.0",
+    "mypy>=1.0",
+    "sphinx>=5.0",
+]
+
+docs = [
+    "sphinx>=5.0",
+    "sphinx-rtd-theme>=1.0",
+    "sphinx-autodoc-typehints>=1.18",
+]
+
+[project.urls]
+Homepage = "https://github.com/Dedoc-9/DEEQN64"
+Documentation = "https://github.com/Dedoc-9/DEEQN64#readme"
+Repository = "https://github.com/Dedoc-9/DEEQN64.git"
+Issues = "https://github.com/Dedoc-9/DEEQN64/issues"
+
+[tool.setuptools]
+packages = ["deeqn64"]
+
+[tool.setuptools.package-data]
+deeqn64 = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312', 'py313', 'py314']
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip = [".venv", "venv", ".env"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["_runtime"]
+python_files = ["test_*.py", "*_test.py"]
+addopts = "-v --cov=deeqn64 --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["deeqn64"]
+omit = [
+    "*/tests/*",
+    "*/test_*.py",
+    "*/__main__.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
