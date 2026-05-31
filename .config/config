@@ -1,0 +1,38 @@
+# Cargo configuration for DEEQN64
+
+[build]
+# Target CPU native optimization
+rustflags = ["-C", "target-cpu=native", "-C", "opt-level=3"]
+
+[doc]
+# Enable all features in documentation
+rustdoc-args = ["--document-private-items", "--html-in-header=doc-header.html"]
+
+[profile.release]
+# Aggressive optimization
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+split-debuginfo = "packed"
+
+[profile.dev]
+# Quick builds for development
+opt-level = 1
+
+[profile.test]
+# Balance between speed and correctness
+opt-level = 1
+debug = true
+
+[profile.bench]
+# Benchmark optimization
+inherits = "release"
+debug = true
+
+[alias]
+# Convenience aliases
+check-all = "check --all-features"
+test-all = "test --all-features"
+doc-all = "doc --all-features --open"
+build-cdylib = "build --release --lib"
