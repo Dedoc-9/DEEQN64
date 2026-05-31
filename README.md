@@ -5,6 +5,8 @@ A reference implementation of Q64, a nonlinear stochastic dynamical system for r
 **Repository:** https://github.com/Dedoc-9/DEEQN64  
 **Status:** Week 1 validation complete. Week 2+ development in progress.
 
+**Contact:** BigDilly95@gmail.com (Author: Daniel J. Dillberg)
+
 ---
 
 ## Overview
