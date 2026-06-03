@@ -29,6 +29,8 @@ class DomainMetrics:
     rank_stable: bool            # Rank stable over window?
     drift_stable: bool           # Drift bounded?
     time_converged: int          # Frame when c_t first triggered (-1 if never)
+    spectral_gap: float = 0.0    # Davis-Kahan gap: λ_rank - λ_{rank+1}
+    conditioning: float = 1.0    # Normalized gap: gap / λ₁ (guard against clustering)
 
 
 class Q64DomainEngine:
@@ -87,7 +89,8 @@ class Q64DomainEngine:
             return DomainMetrics(
                 c_t=False, rank=0, R_t=float('inf'), L_t=0.0,
                 rank_stable=False, drift_stable=False,
-                time_converged=-1
+                time_converged=-1,
+                spectral_gap=0.0, conditioning=1.0
             )
 
         # Compute local covariance
@@ -107,7 +110,8 @@ class Q64DomainEngine:
             return DomainMetrics(
                 c_t=False, rank=0, R_t=float('inf'), L_t=0.0,
                 rank_stable=False, drift_stable=False,
-                time_converged=self.frame_count
+                time_converged=self.frame_count,
+                spectral_gap=0.0, conditioning=1.0
             )
 
         Lambda_k = vals[:self.k]
@@ -122,6 +126,15 @@ class Q64DomainEngine:
         self.rank_history.append(int(rank_t))
         self.rank_history.pop(0)
 
+        # Layer 4b: Davis-Kahan spectral gap analysis (defense against eigenvalue clustering)
+        spectral_gap = 0.0
+        conditioning = 1.0
+        if rank_t > 0 and rank_t < len(vals):
+            # Gap at truncation point: λ_{rank} - λ_{rank+1}
+            spectral_gap = vals[int(rank_t) - 1] - vals[int(rank_t)]
+            # Normalized gap: gap / λ₁ (condition number proxy)
+            conditioning = spectral_gap / (Lambda_k[0] + 1e-10)
+
         # Layer 6 & 7: Projection operator and residual
         P_t = U_k @ np.diag(Lambda_k) @ U_k.T
         R_t = np.linalg.norm(self.G - P_t @ self.G, ord='fro')
@@ -129,7 +142,7 @@ class Q64DomainEngine:
         # Layer 8: Drift functional (trace of P_t @ P_t)
         L_t = np.trace(P_t @ P_t)
 
-        # Layer 9: Convergence predicate (3 conditions)
+        # Layer 9: Convergence predicate (4 conditions, with Davis-Kahan guard)
         cond1 = R_t < self.epsilon_R                    # Residual bounded
 
         # Relaxed rank stability: allow rank to vary within ±1 of median
@@ -139,7 +152,11 @@ class Q64DomainEngine:
 
         cond3 = abs(L_t - self.L_prev) < (self.delta_L * L_t) if L_t > 0 else True  # Drift bounded
 
-        c_t = cond1 and cond2 and cond3
+        # Davis-Kahan guard: manifold is well-conditioned (gap not too small)
+        # conditioning = gap / λ₁; require gap ≥ 5% of λ₁ for eigenvector reliability
+        cond4 = conditioning > 0.05 if rank_t > 0 else True
+
+        c_t = cond1 and cond2 and cond3 and cond4
 
         # Record first convergence
         if c_t and not self.converged_ever:
@@ -155,7 +172,9 @@ class Q64DomainEngine:
             L_t=L_t,
             rank_stable=cond2,
             drift_stable=cond3,
-            time_converged=self.time_converged
+            time_converged=self.time_converged,
+            spectral_gap=spectral_gap,
+            conditioning=conditioning
         )
 
 
