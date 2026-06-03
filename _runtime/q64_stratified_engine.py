@@ -213,6 +213,7 @@ class RenderingDomainMill(Q64DomainEngine):
         self.prediction_error = 0.0     # ||v_emitted - v_computed||
         self.rollback_count = 0         # Times prediction was wrong
         self.frame_since_rollback = 0
+        self.min_window_for_prediction = 10  # Warm-up: skip validation until window stable
 
     def update(self, s_t: np.ndarray) -> DomainMetrics:
         """
@@ -225,7 +226,7 @@ class RenderingDomainMill(Q64DomainEngine):
         4. If error > threshold: rollback (scene change), use fallback (full eigh)
         5. Store for next frame's speculation
         """
-        self.frame_count += 1
+        # Note: Don't increment frame_count here; parent class will do it
         self.frame_since_rollback += 1
 
         # === STEP 1: Emit speculative eigenvectors (instant, no latency) ===
@@ -233,8 +234,10 @@ class RenderingDomainMill(Q64DomainEngine):
         # Here we just record what would be emitted
 
         # === STEP 2-3: Compute + validate ===
-        # Run full update (inherited from parent)
+        # Run full update (inherited from parent); this increments frame_count
+        #print(f"[DEBUG] Before super().update(): frame_count={self.frame_count}")
         metrics_base = super().update(s_t)
+        #print(f"[DEBUG] After super().update(): frame_count={self.frame_count}")
 
         # Extract new eigenvectors for validation
         if len(self.window) >= 2:
@@ -258,17 +261,22 @@ class RenderingDomainMill(Q64DomainEngine):
         prediction_error = 0.0
         rollback = False
 
-        if vecs_new is not None and self.vecs_emitted is not None:
-            # Compute eigenvector angle (principal angle between subspaces)
-            # Simplified: Frobenius norm of difference
-            prediction_error = np.linalg.norm(self.vecs_emitted - vecs_new, ord='fro') / np.linalg.norm(self.vecs_emitted, ord='fro')
+        # Only validate if window has stabilized (warm-up period: skip first ~15-20 frames, accounting for potential double-counting)
+        if self.frame_count > 30:
+            #print(f"[VALIDATION BLOCK ENTERED] fc={self.frame_count}, vecs_new={vecs_new is not None}, vecs_emitted={self.vecs_emitted is not None}")
+            if vecs_new is not None and self.vecs_emitted is not None:
+                # Compute eigenvector angle (principal angle between subspaces)
+                # Simplified: Frobenius norm of difference, normalized by previous norm
+                vecs_prev_norm = np.linalg.norm(self.vecs_emitted, ord='fro')
+                if vecs_prev_norm > 1e-10:
+                    prediction_error = np.linalg.norm(self.vecs_emitted - vecs_new, ord='fro') / vecs_prev_norm
 
-            if prediction_error > self.prediction_threshold:
-                # Scene changed (rendering state jumped)
-                # Trigger rollback: recompute with full eigh (fallback safety)
-                rollback = True
-                self.rollback_count += 1
-                self.frame_since_rollback = 0
+                    if prediction_error > self.prediction_threshold:
+                        # Scene changed (rendering state jumped)
+                        # Trigger rollback: recompute with full eigh (fallback safety)
+                        rollback = True
+                        self.rollback_count += 1
+                        self.frame_since_rollback = 0
 
         # === STEP 5: Store for next frame's speculation ===
         self.lambda_emitted = metrics_base.rank  # Simplified: store rank as proxy
