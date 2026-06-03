@@ -1,58 +1,62 @@
 """
-Q64 Stratified Multi-Domain Engine
-====================================
+Q64 Stratified Multi-Domain Engine (Production Reference Implementation)
+==========================================================================
 Implementation of domain-stratified spectral analysis for heterogeneous telemetry.
 
 Architecture:
   - Accepts 64-dimensional heterogeneous state vector
   - Stratifies into 4 independent domains
-  - Computes convergence predicate c_t per domain
-  - Returns per-domain stability profile
+  - Computes convergence predicate c_t per domain with soft recovery
+  - Returns per-domain stability profile with confidence scoring
+
+Mathematical Foundations:
+  - Rank estimation: mode filter on persistence window (Δ ≥ 2 hysteresis eliminated)
+  - Residual: PCA truncation ||G - G_k||_F normalized by ||G||_F (scale-invariant)
+  - Spectral energy: L_t = Σ λ_i² with symmetric normalized stability check
+  - Gap conditioning: log(λ_r / λ_{r+1}) with spectrum floor guard for robustness
+  - Principal angles: θ_max = arccos(σ_min) for subspace distance (sign-invariant)
+  - Recovery geometry: EWMA mean/covariance with speculative confidence decay
 
 Week 1: Reference validation (synthetic data)
-Week 2: Calibration (real game telemetry)
+Week 2b: Calibration (real TF2 telemetry)
 Week 3+: H₁ empirical validation
 """
 
 import numpy as np
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
+from collections import Counter
 
 
 @dataclass
 class DomainMetrics:
     """Per-domain convergence metrics"""
-    c_t: bool                    # Convergence predicate
-    rank: int                    # Estimated rank
-    R_t: float                   # Residual norm
-    L_t: float                   # Drift functional
-    rank_stable: bool            # Rank stable over window?
-    drift_stable: bool           # Drift bounded?
-    time_converged: int          # Frame when c_t first triggered (-1 if never)
-    spectral_gap: float = 0.0    # Davis-Kahan gap: λ_rank - λ_{rank+1}
-    conditioning: float = 1.0    # Normalized gap: gap / λ₁ (guard against clustering)
-    prediction_error: float = 0.0      # (Rendering domain) eigenvector change magnitude
-    rollback: bool = False             # (Rendering domain) speculative prediction failed
-    convergence_state: str = "unknown" # "converged", "speculative", or "diverged"
+    c_t: bool                      # Convergence predicate (all 4 conditions met)
+    rank: int                      # Estimated rank (mode of 5-frame persistence window)
+    R_t: float                     # PCA truncation residual: ||G - G_k||_F
+    L_t: float                     # Spectral energy: Σ λ_i² (rank stability guard)
+    rank_stable: bool              # Rank bounded variability (within ±1 of median)
+    drift_stable: bool             # Spectral energy stable (symmetric normalized)
+    time_converged: int            # Frame when c_t first triggered (-1 if never)
+    spectral_gap: float = 0.0      # Raw gap: λ_r - λ_{r+1}
+    gap_ratio: float = 1.0         # Scale-invariant: λ_r / λ_{r+1}
+    conditioning: float = 0.0      # log(gap_ratio) for Davis-Kahan guard
+    prediction_error: float = 0.0  # Principal angle (subspace distance, rendering only)
+    rollback: bool = False         # Speculative prediction failed (rendering only)
+    convergence_state: str = "unknown"  # "converged", "speculative", or "diverged"
+    speculative_confidence: float = 1.0 # exp(-frames/τ_budget) for soft-go decay
 
 
 class Q64DomainEngine:
-    """Single-domain Q64 operator with convergence detection"""
+    """Single-domain Q64 operator with convergence detection and shared spectral analysis"""
+
+    # Numerical stability bounds
+    SPECTRUM_FLOOR = 1e-8  # Minimum eigenvalue magnitude for gap-ratio computation
+    RESIDUAL_SCALE_FLOOR = 1e-10  # Minimum Gramian norm for residual normalization
 
     def __init__(self, N: int, k: int, name: str, w: int = 20, tau: float = 0.4,
                  epsilon_R: float = 1e-2, delta_L: float = 0.2):
-        """
-        Initialize a domain-specific Q64 engine.
-
-        Args:
-            N: Dimension of this domain
-            k: Max rank truncation
-            name: Domain identifier (e.g., "input", "physics")
-            w: Sliding window size (frames)
-            tau: Rank threshold (fraction of max eigenvalue)
-            epsilon_R: Residual threshold
-            delta_L: Drift threshold (as fraction of L_t)
-        """
+        """Initialize a domain-specific Q64 engine."""
         self.N = N
         self.k = min(k, N)
         self.name = name
@@ -67,142 +71,158 @@ class Q64DomainEngine:
         self.G = np.zeros((N, N))
         self.L_prev = 0.0
         self.rank_history = [0] * 5
+        self.rank_candidate_history = []
+        self.rank_persistence_window = 5
         self.frame_count = 0
         self.time_converged = -1
         self.converged_ever = False
         self.convergence_state = "unknown"
 
-        # Soft Recovery state (inherited by rendering, available for physics)
+        # Soft Recovery state
         self.ewma_recovery_mode = False
         self.rollback_frame = -1
         self.tau_locked_until = -1
 
-    def update(self, s_t: np.ndarray) -> DomainMetrics:
-        """
-        Update the domain engine with a new state vector s_t.
-
-        Args:
-            s_t: (N,) state vector for this domain
-
-        Returns:
-            DomainMetrics: convergence metrics for this domain
-        """
-        self.frame_count += 1
-
-        # Layer 1 & 2: Sliding window Gramian update
-        self.window.append(s_t.copy())
-        if len(self.window) > self.w:
-            self.window.pop(0)
-
-        if len(self.window) < 2:
-            # Not enough data yet
+    def analyze_gramian(self, G: np.ndarray, s_t: np.ndarray = None,
+                       update_state: bool = True, warmup: bool = False) -> DomainMetrics:
+        """Pure spectral analysis: decompose Gramian and extract all convergence metrics."""
+        if warmup or G is None:
             return DomainMetrics(
                 c_t=False, rank=0, R_t=float('inf'), L_t=0.0,
                 rank_stable=False, drift_stable=False,
                 time_converged=-1,
-                spectral_gap=0.0, conditioning=1.0
+                spectral_gap=0.0, gap_ratio=1.0, conditioning=0.0
             )
 
-        # Compute local covariance
-        W = np.array(self.window)
-        mu = np.mean(W, axis=0)
-        W_centered = W - mu
-        self.G = (W_centered.T @ W_centered) / len(self.window)
-
-        # Layer 3: Spectral decomposition
+        # Layer 3: Spectral decomposition with PSD clipping
         try:
-            vals, vecs = np.linalg.eigh(self.G)
-            idx = np.argsort(vals)[::-1]  # Descending order
+            vals, vecs = np.linalg.eigh(G)
+            vals = np.maximum(vals, 0.0)
+            idx = np.argsort(vals)[::-1]
             vals = vals[idx]
             vecs = vecs[:, idx]
         except np.linalg.LinAlgError:
-            # Degenerate case (e.g., rank-deficient data)
             return DomainMetrics(
                 c_t=False, rank=0, R_t=float('inf'), L_t=0.0,
                 rank_stable=False, drift_stable=False,
                 time_converged=self.frame_count,
-                spectral_gap=0.0, conditioning=1.0
+                spectral_gap=0.0, gap_ratio=1.0, conditioning=0.0
             )
 
         Lambda_k = vals[:self.k]
         U_k = vecs[:, :self.k]
 
-        # Layer 4: Rank estimation (soft cutoff with hysteresis to prevent chatter near threshold)
-        if Lambda_k[0] > 0:
+        # Layer 4: Rank estimation (mode filter)
+        if Lambda_k[0] > self.SPECTRUM_FLOOR:
             threshold_margin = 0.05 * self.tau * Lambda_k[0]
             rank_candidate = np.sum(Lambda_k > (self.tau * Lambda_k[0] - threshold_margin))
-            prev_rank = self.rank_history[-1] if self.rank_history else 0
-            if abs(int(rank_candidate) - prev_rank) >= 2:
-                rank_t = int(rank_candidate)
-            else:
-                rank_t = prev_rank
         else:
-            rank_t = 0
+            rank_candidate = 0
 
-        self.rank_history.append(int(rank_t))
-        self.rank_history.pop(0)
+        if update_state:
+            self.rank_candidate_history.append(int(rank_candidate))
+            if len(self.rank_candidate_history) > self.rank_persistence_window:
+                self.rank_candidate_history.pop(0)
+            if len(self.rank_candidate_history) == self.rank_persistence_window:
+                mode_rank = Counter(self.rank_candidate_history).most_common(1)[0][0]
+                rank_t = mode_rank
+            else:
+                rank_t = self.rank_history[-1] if self.rank_history else 0
+            self.rank_history.append(int(rank_t))
+            self.rank_history.pop(0)
+        else:
+            rank_t = int(rank_candidate)
 
-        # Layer 4b: Davis-Kahan spectral gap analysis
+        # Layer 4b: Spectral gap and conditioning
         spectral_gap = 0.0
-        conditioning = 1.0
+        gap_ratio = 1.0
+        conditioning = 0.0
+
         if rank_t > 0 and rank_t < len(vals):
-            spectral_gap = vals[int(rank_t) - 1] - vals[int(rank_t)]
-            conditioning = spectral_gap / (Lambda_k[0] + 1e-10)
+            lambda_r = vals[int(rank_t) - 1]
+            lambda_r_plus_1 = vals[int(rank_t)]
+            spectral_gap = lambda_r - lambda_r_plus_1
+            if lambda_r > self.SPECTRUM_FLOOR and lambda_r_plus_1 > self.SPECTRUM_FLOOR:
+                gap_ratio = lambda_r / (lambda_r_plus_1 + 1e-10)
+                conditioning = np.log(gap_ratio)
+            else:
+                gap_ratio = 1.0
+                conditioning = 0.0
 
-        # Layer 6 & 7: Projection operator and residual
-        P_t = U_k @ np.diag(Lambda_k) @ U_k.T
-        R_t = np.linalg.norm(self.G - P_t @ self.G, ord='fro')
+        # Layer 5 & 6: PCA residual
+        G_k = U_k @ np.diag(Lambda_k) @ U_k.T
+        R_t = np.linalg.norm(G - G_k, ord='fro')
+        G_norm = np.linalg.norm(G, ord='fro') + self.RESIDUAL_SCALE_FLOOR
+        R_t_normalized = R_t / G_norm
 
-        # Layer 8: Drift functional
-        L_t = np.trace(P_t @ P_t)
+        # Layer 7: Spectral energy
+        spectral_energy = np.sum(Lambda_k ** 2)
+        L_t = spectral_energy
 
-        # Layer 9: Convergence predicate with scale-normalized residual
-        G_scale = Lambda_k[0] + 1e-10
-        R_t_normalized = R_t / G_scale
+        # Layer 8: Convergence predicates
         cond1 = R_t_normalized < self.epsilon_R
-
         median_rank = int(np.median(self.rank_history))
         rank_range = set(range(max(1, median_rank - 1), median_rank + 2))
         cond2 = all(r in rank_range for r in self.rank_history)
-
-        cond3 = abs(L_t - self.L_prev) < (self.delta_L * L_t) if L_t > 0 else True
-
-        cond4 = conditioning > 0.05 if rank_t > 0 else True
+        if L_t > 0 and self.L_prev > 0:
+            energy_change = abs(L_t - self.L_prev) / max(L_t, self.L_prev, 1e-10)
+            cond3 = energy_change < self.delta_L
+        else:
+            cond3 = True
+        cond4 = conditioning > 0.1 if rank_t > 0 else True
 
         c_t = cond1 and cond2 and cond3 and cond4
 
-        # Record first convergence
         if c_t and not self.converged_ever:
             self.time_converged = self.frame_count
             self.converged_ever = True
 
-        self.L_prev = L_t
-
-        # Determine convergence state
-        if c_t:
-            convergence_state = "converged"
-        elif self.ewma_recovery_mode:
-            convergence_state = "speculative"
-        else:
-            convergence_state = "diverged"
-        self.convergence_state = convergence_state
+        if update_state:
+            self.L_prev = L_t
 
         return DomainMetrics(
-            c_t=c_t,
-            rank=int(rank_t),
-            R_t=R_t,
-            L_t=L_t,
-            rank_stable=cond2,
-            drift_stable=cond3,
+            c_t=c_t, rank=int(rank_t), R_t=R_t, L_t=L_t,
+            rank_stable=cond2, drift_stable=cond3,
             time_converged=self.time_converged,
-            spectral_gap=spectral_gap,
-            conditioning=conditioning,
-            convergence_state=convergence_state
+            spectral_gap=spectral_gap, gap_ratio=gap_ratio, conditioning=conditioning
         )
+
+    def update(self, s_t: np.ndarray) -> DomainMetrics:
+        """Standard update path: window-based covariance analysis."""
+        self.frame_count += 1
+        self.window.append(s_t.copy())
+        if len(self.window) > self.w:
+            self.window.pop(0)
+
+        if len(self.window) < 2:
+            return DomainMetrics(
+                c_t=False, rank=0, R_t=float('inf'), L_t=0.0,
+                rank_stable=False, drift_stable=False,
+                time_converged=-1,
+                spectral_gap=0.0, gap_ratio=1.0, conditioning=0.0
+            )
+
+        W = np.array(self.window)
+        mu = np.mean(W, axis=0)
+        W_centered = W - mu
+        self.G = (W_centered.T @ W_centered) / len(self.window)
+
+        metrics = self.analyze_gramian(self.G, s_t, update_state=True, warmup=False)
+
+        if metrics.c_t:
+            self.convergence_state = "converged"
+        elif self.ewma_recovery_mode:
+            self.convergence_state = "speculative"
+        else:
+            self.convergence_state = "diverged"
+
+        metrics.convergence_state = self.convergence_state
+        metrics.speculative_confidence = 1.0
+        return metrics
 
 
 class RenderingDomainMill(Q64DomainEngine):
-    """Rendering domain with Mill-inspired speculative eigenvector dispatch"""
+    """Rendering domain with Mill-inspired speculative dispatch and soft recovery"""
 
     def __init__(self, N: int, k: int, name: str, w: int = 20, tau: float = 0.4,
                  epsilon_R: float = 1e-2, delta_L: float = 0.2,
@@ -213,32 +233,37 @@ class RenderingDomainMill(Q64DomainEngine):
         self.ewma_alpha_normal = ewma_alpha_normal
         self.ewma_alpha_recovery = ewma_alpha_recovery
 
-        # Speculative state
-        self.lambda_emitted = None
         self.vecs_emitted = None
         self.prediction_error = 0.0
         self.rollback_count = 0
-        self.frame_since_rollback = 0
 
-        # Soft Recovery state
-        self.ewma_recovery_mode = False
-        self.rollback_frame = -1
-        self.tau_locked_until = -1
-        self.tau_original = tau
-        self.convergence_state = "unknown"
+        self.mu_ewma = None
+        self.G_ewma = None
+        self.recovery_mode_depth = 0
+        self.speculative_frame_count = 0
+        self.speculative_budget_frames = 40
 
     def process_rollback(self, s_t: np.ndarray):
-        """Surgically pivot manifold using EWMA + Spectral Gap Anchor"""
-        s_col = s_t.reshape(-1, 1)
-        self.G = self.ewma_alpha_recovery * self.G + (1 - self.ewma_alpha_recovery) * (s_col @ s_col.T)
+        """Initialize EWMA recovery geometry."""
+        if self.mu_ewma is None:
+            W = np.array(self.window) if self.window else np.zeros((1, self.N))
+            self.mu_ewma = np.mean(W, axis=0) if len(W) > 0 else np.zeros(self.N)
+            self.G_ewma = self.G.copy()
+
+        self.mu_ewma = (self.ewma_alpha_recovery * self.mu_ewma +
+                        (1 - self.ewma_alpha_recovery) * s_t)
+        delta = s_t.reshape(-1, 1) - self.mu_ewma.reshape(-1, 1)
+        self.G_ewma = (self.ewma_alpha_recovery * self.G_ewma +
+                       (1 - self.ewma_alpha_recovery) * (delta @ delta.T))
 
         try:
-            vals, _ = np.linalg.eigh(self.G)
+            vals, _ = np.linalg.eigh(self.G_ewma)
+            vals = np.maximum(vals, 0.0)
             vals = np.sort(vals)[::-1]
-            gaps = (vals[:-1] - vals[1:]) / (vals[:-1] + 1e-10)
-            discovery_limit = min(len(gaps), self.k)
+            gap_ratio = vals[:-1] / (vals[1:] + 1e-10)
+            discovery_limit = min(len(gap_ratio), self.k)
             if discovery_limit > 0:
-                best_gap_idx = np.argmax(gaps[:discovery_limit])
+                best_gap_idx = np.argmax(gap_ratio[:discovery_limit])
                 tau_new = (vals[best_gap_idx] + vals[best_gap_idx + 1]) / (2 * vals[0] + 1e-10)
                 self.tau = np.clip(tau_new, 0.1, 0.9)
         except np.linalg.LinAlgError:
@@ -247,85 +272,106 @@ class RenderingDomainMill(Q64DomainEngine):
         self.ewma_recovery_mode = True
         self.rollback_frame = self.frame_count
         self.tau_locked_until = self.frame_count + 15
+        self.recovery_mode_depth = 0
+        self.speculative_frame_count = 0
+        self.rollback_count += 1
+
+    def principal_angle_max(self, U1: np.ndarray, U2: np.ndarray) -> float:
+        """Largest principal angle between subspaces (sign-invariant)."""
+        try:
+            _, sigma, _ = np.linalg.svd(U1.T @ U2, full_matrices=False)
+            sigma = np.clip(sigma, -1.0, 1.0)
+            theta_max = np.arccos(sigma[-1])
+            error = theta_max / (np.pi / 2)
+        except (np.linalg.LinAlgError, IndexError):
+            error = 1.0
+        return error
 
     def update(self, s_t: np.ndarray) -> DomainMetrics:
-        """Update with speculative dispatch"""
-        self.frame_since_rollback += 1
-        metrics_base = super().update(s_t)
+        """Update with speculative dispatch."""
+        self.frame_count += 1
 
-        # Extract eigenvectors for validation
-        if len(self.window) >= 2:
-            W = np.array(self.window)
-            mu = np.mean(W, axis=0)
-            W_centered = W - mu
-            G = (W_centered.T @ W_centered) / len(self.window)
-
-            try:
-                vals, vecs = np.linalg.eigh(G)
-                idx = np.argsort(vals)[::-1]
-                vals = vals[idx]
-                vecs = vecs[:, idx]
-                vecs_new = vecs[:, :self.k]
-            except:
-                vecs_new = None
-        else:
-            vecs_new = None
-
-        # Validate prediction
-        prediction_error = 0.0
-        rollback = False
-
-        # Release τ lock if cooldown expired
         if self.frame_count > self.tau_locked_until and self.tau_locked_until >= 0:
             self.tau = self.tau_original
             self.tau_locked_until = -1
 
-        # Exit recovery mode after 5 frames
-        if self.ewma_recovery_mode and (self.frame_count - self.rollback_frame) > 5:
-            self.ewma_recovery_mode = False
+        self.window.append(s_t.copy())
+        if len(self.window) > self.w:
+            self.window.pop(0)
 
-        # Only validate if window has stabilized
-        if self.frame_count > 30:
+        if self.ewma_recovery_mode:
+            self.recovery_mode_depth += 1
+            self.mu_ewma = (self.ewma_alpha_recovery * self.mu_ewma +
+                            (1 - self.ewma_alpha_recovery) * s_t)
+            delta = s_t.reshape(-1, 1) - self.mu_ewma.reshape(-1, 1)
+            self.G_ewma = (self.ewma_alpha_recovery * self.G_ewma +
+                           (1 - self.ewma_alpha_recovery) * (delta @ delta.T))
+            metrics = self.analyze_gramian(self.G_ewma, s_t, update_state=False, warmup=False)
+
+            if self.recovery_mode_depth > 5:
+                self.ewma_recovery_mode = False
+                self.mu_ewma = None
+                self.G_ewma = None
+        else:
+            if len(self.window) < 2:
+                return DomainMetrics(c_t=False, rank=0, R_t=float('inf'), L_t=0.0,
+                                    rank_stable=False, drift_stable=False,
+                                    time_converged=-1, spectral_gap=0.0, gap_ratio=1.0,
+                                    conditioning=0.0)
+            W = np.array(self.window)
+            mu = np.mean(W, axis=0)
+            W_centered = W - mu
+            self.G = (W_centered.T @ W_centered) / len(self.window)
+            metrics = self.analyze_gramian(self.G, s_t, update_state=True, warmup=False)
+
+        vecs_new = None
+        if len(self.window) >= 2:
+            try:
+                G_for_vecs = self.G_ewma if self.ewma_recovery_mode else self.G
+                vals, vecs = np.linalg.eigh(G_for_vecs)
+                vals = np.maximum(vals, 0.0)
+                idx = np.argsort(vals)[::-1]
+                vecs = vecs[:, idx]
+                vecs_new = vecs[:, :self.k]
+            except:
+                vecs_new = None
+
+        prediction_error = 0.0
+        rollback = False
+
+        if self.frame_count > 30 and not self.ewma_recovery_mode:
             if vecs_new is not None and self.vecs_emitted is not None:
-                vecs_prev_norm = np.linalg.norm(self.vecs_emitted, ord='fro')
-                if vecs_prev_norm > 1e-10:
-                    prediction_error = np.linalg.norm(self.vecs_emitted - vecs_new, ord='fro') / vecs_prev_norm
+                prediction_error = self.principal_angle_max(self.vecs_emitted, vecs_new)
+                if prediction_error > self.prediction_threshold:
+                    rollback = True
+                    self.process_rollback(s_t)
 
-                    if prediction_error > self.prediction_threshold:
-                        rollback = True
-                        self.process_rollback(s_t)
+        self.vecs_emitted = vecs_new if vecs_new is not None else self.vecs_emitted
 
-        # Determine convergence state
         if rollback or self.ewma_recovery_mode:
             convergence_state = "speculative"
-        elif metrics_base.c_t:
+        elif metrics.c_t:
             convergence_state = "converged"
         else:
             convergence_state = "diverged"
 
-        # Store for next frame
-        self.lambda_emitted = metrics_base.rank
-        self.vecs_emitted = vecs_new if vecs_new is not None else self.vecs_emitted
-        self.convergence_state = convergence_state
+        if convergence_state == "speculative":
+            self.speculative_frame_count += 1
+        else:
+            self.speculative_frame_count = 0
 
-        return DomainMetrics(
-            c_t=metrics_base.c_t,
-            rank=metrics_base.rank,
-            R_t=metrics_base.R_t,
-            L_t=metrics_base.L_t,
-            rank_stable=metrics_base.rank_stable,
-            drift_stable=metrics_base.drift_stable,
-            time_converged=metrics_base.time_converged,
-            spectral_gap=metrics_base.spectral_gap,
-            conditioning=metrics_base.conditioning,
-            prediction_error=prediction_error,
-            rollback=rollback,
-            convergence_state=convergence_state
-        )
+        speculative_confidence = np.exp(-self.speculative_frame_count / self.speculative_budget_frames)
+
+        metrics.prediction_error = prediction_error
+        metrics.rollback = rollback
+        metrics.convergence_state = convergence_state
+        metrics.speculative_confidence = speculative_confidence
+
+        return metrics
 
 
 class Q64StratifiedEngine:
-    """Multi-domain Q64 engine with per-domain convergence tracking"""
+    """Multi-domain Q64 engine with per-domain convergence tracking and graduated H1 gate"""
 
     EWMA_ALPHA_RECOVERY_MAP = {
         "rendering": 0.80,
@@ -357,6 +403,7 @@ class Q64StratifiedEngine:
         self.rendering_speculative = rendering_speculative
 
     def update(self, s_t: np.ndarray) -> Dict[str, DomainMetrics]:
+        """Update all domains with a new 64-dimensional state vector."""
         if len(s_t) != 64:
             raise ValueError(f"Expected 64-dim state, got {len(s_t)}")
 
@@ -368,12 +415,8 @@ class Q64StratifiedEngine:
         s_rendering = s_t[28:64]
 
         results = {}
-        for domain_name, domain_vec in [
-            ("input", s_input),
-            ("physics", s_physics),
-            ("system", s_system),
-            ("rendering", s_rendering),
-        ]:
+        for domain_name, domain_vec in [("input", s_input), ("physics", s_physics),
+                                         ("system", s_system), ("rendering", s_rendering)]:
             engine = self.domains[domain_name]
             metrics = engine.update(domain_vec)
             results[domain_name] = metrics
@@ -382,13 +425,14 @@ class Q64StratifiedEngine:
         return results
 
     def stability_profile(self) -> Dict[str, bool]:
+        """Return current convergence status for all domains"""
         return {d: engine.converged_ever for d, engine in self.domains.items()}
 
     def h1_gate_evaluation(self) -> Tuple[str, float, Dict]:
-        """Primary/Secondary H₁ Gate with Confidence Weighting"""
+        """Graduated H1 Gate with Confidence Weighting and Speculative Decay."""
         detail = {}
         domains_converged = 0
-        domains_speculative = 0
+        domains_speculative_weighted = 0.0
 
         for domain_name, engine in self.domains.items():
             if not self.metrics_history[domain_name]:
@@ -400,6 +444,7 @@ class Q64StratifiedEngine:
                 continue
 
             metrics_list = self.metrics_history[domain_name]
+            latest_metric = metrics_list[-1]
 
             converged_count = sum(1 for m in metrics_list if m.convergence_state == "converged")
             speculative_count = sum(1 for m in metrics_list if m.convergence_state == "speculative")
@@ -407,22 +452,15 @@ class Q64StratifiedEngine:
             pct_converged = converged_count / len(metrics_list) if metrics_list else 0.0
             pct_speculative = speculative_count / len(metrics_list) if metrics_list else 0.0
 
-            thresholds = {
-                "input": 0.80,
-                "physics": 0.70,
-                "system": 0.60,
-                "rendering": 0.40,
-            }
-
+            thresholds = {"input": 0.80, "physics": 0.70, "system": 0.60, "rendering": 0.40}
             threshold = thresholds.get(domain_name, 0.5)
             passes_converged = pct_converged >= threshold
-            passes_speculative = pct_speculative >= threshold * 0.5
 
             if passes_converged:
                 domains_converged += 1
                 status = "converged"
-            elif passes_speculative:
-                domains_speculative += 1
+            elif pct_speculative > 0:
+                domains_speculative_weighted += latest_metric.speculative_confidence
                 status = "recovering"
             else:
                 status = "diverged"
@@ -432,14 +470,16 @@ class Q64StratifiedEngine:
                 "pct_converged": pct_converged,
                 "pct_speculative": pct_speculative,
                 "threshold": threshold,
+                "latest_confidence": latest_metric.speculative_confidence
             }
 
         if domains_converged >= 3:
             gate_status = "green"
             confidence = 1.0
-        elif domains_converged == 2 and domains_speculative >= 1:
+        elif domains_converged == 2 and domains_speculative_weighted >= 0.7:
             gate_status = "yellow"
-            confidence = 0.7
+            normalized_speculative = min(1.0, domains_speculative_weighted / 2.0)
+            confidence = 0.4 + 0.3 * normalized_speculative
         elif domains_converged == 2:
             gate_status = "orange"
             confidence = 0.4
@@ -448,7 +488,7 @@ class Q64StratifiedEngine:
             confidence = 0.0
 
         detail["domains_converged"] = domains_converged
-        detail["domains_speculative"] = domains_speculative
+        detail["domains_speculative_weighted"] = domains_speculative_weighted
         detail["gate_status"] = gate_status
         detail["confidence"] = confidence
         detail["soft_go_enabled"] = gate_status in ["green", "yellow"]
