@@ -119,9 +119,21 @@ class Q64DomainEngine:
         Lambda_k = vals[:self.k]
         U_k = vecs[:, :self.k]
 
-        # Layer 4: Rank estimation
+        # Layer 4: Rank estimation (soft cutoff with hysteresis to prevent chatter near threshold)
+        # Hard threshold: rank_t = np.sum(Lambda_k > (self.tau * Lambda_k[0]))
+        # Problem: if λ_i ≈ τ·λ₁, noise causes rank to oscillate, breaking rank_stable check
+        # Fix: compute candidate rank, but only update if change ≥ 2 (hysteresis) or use smoothed threshold
         if Lambda_k[0] > 0:
-            rank_t = np.sum(Lambda_k > (self.tau * Lambda_k[0]))
+            # Soft margin: add small buffer to threshold to reduce near-boundary chatter
+            threshold_margin = 0.05 * self.tau * Lambda_k[0]  # 5% margin
+            rank_candidate = np.sum(Lambda_k > (self.tau * Lambda_k[0] - threshold_margin))
+
+            # Apply hysteresis: only change rank if delta >= 2 (smoothing filter)
+            prev_rank = self.rank_history[-1] if self.rank_history else 0
+            if abs(int(rank_candidate) - prev_rank) >= 2:
+                rank_t = int(rank_candidate)
+            else:
+                rank_t = prev_rank
         else:
             rank_t = 0
 
@@ -145,7 +157,13 @@ class Q64DomainEngine:
         L_t = np.trace(P_t @ P_t)
 
         # Layer 9: Convergence predicate (4 conditions, with Davis-Kahan guard)
-        cond1 = R_t < self.epsilon_R                    # Residual bounded
+        # FIX: Scale-normalize residual to handle heterogeneous domain dimensions
+        # Problem: static ε_R = 0.01 inappropriate across domains (rendering 36-dim vs physics 6-dim)
+        # Rendering has larger ||G||_F naturally; this creates false negatives
+        # Solution: normalize by Gramian scale (use λ₁ as proxy for matrix magnitude)
+        G_scale = Lambda_k[0] + 1e-10  # Largest eigenvalue as scale reference
+        R_t_normalized = R_t / G_scale  # Dimensionless residual
+        cond1 = R_t_normalized < self.epsilon_R  # Residual bounded (now scale-invariant)
 
         # Relaxed rank stability: allow rank to vary within ±1 of median
         median_rank = int(np.median(self.rank_history))
