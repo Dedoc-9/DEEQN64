@@ -5,21 +5,23 @@ Implementation of domain-stratified spectral analysis for heterogeneous telemetr
 
 Architecture:
   - Accepts 64-dimensional heterogeneous state vector
-  - Stratifies into 4 independent domains
+  - Stratifies into 4 independent domains (Input 10D, Physics 6D, System 12D, Rendering 36D)
   - Computes convergence predicate c_t per domain with soft recovery
   - Returns per-domain stability profile with confidence scoring
+  - Tracks manifold velocity via Grassmannian distance (innovation metric)
 
 Mathematical Foundations:
-  - Rank estimation: mode filter on persistence window (Δ ≥ 2 hysteresis eliminated)
+  - Rank estimation: mode filter on 5-frame persistence window (robust to noise)
   - Residual: PCA truncation ||G - G_k||_F normalized by ||G||_F (scale-invariant)
   - Spectral energy: L_t = Σ λ_i² with symmetric normalized stability check
-  - Gap conditioning: log(λ_r / λ_{r+1}) with spectrum floor guard for robustness
+  - Gap conditioning: log(λ_r / λ_{r+1}) with spectrum floor guard (PSD-clipped)
   - Principal angles: θ_max = arccos(σ_min) for subspace distance (sign-invariant)
-  - Recovery geometry: EWMA mean/covariance with speculative confidence decay
+  - Innovation: η_t = sqrt(Σ(1 - σ_i²)) as Grassmannian manifold velocity
+  - Recovery geometry: EWMA mean/covariance with domain-specific α, speculative confidence decay
 
 Week 1: Reference validation (synthetic data)
-Week 2b: Calibration (real TF2 telemetry)
-Week 3+: H₁ empirical validation
+Week 2b: Calibration (real TF2 telemetry at 60 Hz)
+Week 3+: H₁ empirical validation with soft-go decision automation
 """
 
 import numpy as np
@@ -30,7 +32,7 @@ from collections import Counter
 
 @dataclass
 class DomainMetrics:
-    """Per-domain convergence metrics"""
+    """Per-domain convergence and spectral metrics"""
     c_t: bool                      # Convergence predicate (all 4 conditions met)
     rank: int                      # Estimated rank (mode of 5-frame persistence window)
     R_t: float                     # PCA truncation residual: ||G - G_k||_F
@@ -45,6 +47,7 @@ class DomainMetrics:
     rollback: bool = False         # Speculative prediction failed (rendering only)
     convergence_state: str = "unknown"  # "converged", "speculative", or "diverged"
     speculative_confidence: float = 1.0 # exp(-frames/τ_budget) for soft-go decay
+    innovation: float = 0.0        # Grassmannian distance (manifold velocity)
 
 
 class Q64DomainEngine:
@@ -56,7 +59,18 @@ class Q64DomainEngine:
 
     def __init__(self, N: int, k: int, name: str, w: int = 20, tau: float = 0.4,
                  epsilon_R: float = 1e-2, delta_L: float = 0.2):
-        """Initialize a domain-specific Q64 engine."""
+        """
+        Initialize a domain-specific Q64 engine.
+
+        Args:
+            N: Dimension of this domain
+            k: Max rank truncation
+            name: Domain identifier (e.g., "input", "physics")
+            w: Sliding window size (frames)
+            tau: Rank threshold (fraction of max eigenvalue)
+            epsilon_R: Residual threshold (fractional, normalized by ||G||_F)
+            delta_L: Drift threshold (fractional, symmetric normalized)
+        """
         self.N = N
         self.k = min(k, N)
         self.name = name
@@ -85,7 +99,22 @@ class Q64DomainEngine:
 
     def analyze_gramian(self, G: np.ndarray, s_t: np.ndarray = None,
                        update_state: bool = True, warmup: bool = False) -> DomainMetrics:
-        """Pure spectral analysis: decompose Gramian and extract all convergence metrics."""
+        """
+        Pure spectral analysis: decompose Gramian and extract all convergence metrics.
+
+        Single source of truth for spectral computation.
+        Called by both normal and recovery paths.
+
+        Args:
+            G: (N, N) covariance/Gramian matrix (will be PSD-clipped)
+            s_t: (N,) current state (optional, for diagnostics)
+            update_state: bool, whether to update rank/energy history
+                         (False during recovery to avoid contaminating convergence statistics)
+            warmup: bool, if True, skip analysis and return zeros (insufficient data)
+
+        Returns:
+            DomainMetrics with all spectral quantities computed
+        """
         if warmup or G is None:
             return DomainMetrics(
                 c_t=False, rank=0, R_t=float('inf'), L_t=0.0,
@@ -94,11 +123,11 @@ class Q64DomainEngine:
                 spectral_gap=0.0, gap_ratio=1.0, conditioning=0.0
             )
 
-        # Layer 3: Spectral decomposition with PSD clipping
+        # === Layer 3: Spectral decomposition with PSD clipping ===
         try:
             vals, vecs = np.linalg.eigh(G)
-            vals = np.maximum(vals, 0.0)
-            idx = np.argsort(vals)[::-1]
+            vals = np.maximum(vals, 0.0)  # Clip negative eigenvalues (numerical errors)
+            idx = np.argsort(vals)[::-1]  # Descending order
             vals = vals[idx]
             vecs = vecs[:, idx]
         except np.linalg.LinAlgError:
@@ -112,7 +141,7 @@ class Q64DomainEngine:
         Lambda_k = vals[:self.k]
         U_k = vecs[:, :self.k]
 
-        # Layer 4: Rank estimation (mode filter)
+        # === Layer 4: Rank estimation (mode filter on persistence window) ===
         if Lambda_k[0] > self.SPECTRUM_FLOOR:
             threshold_margin = 0.05 * self.tau * Lambda_k[0]
             rank_candidate = np.sum(Lambda_k > (self.tau * Lambda_k[0] - threshold_margin))
@@ -123,17 +152,20 @@ class Q64DomainEngine:
             self.rank_candidate_history.append(int(rank_candidate))
             if len(self.rank_candidate_history) > self.rank_persistence_window:
                 self.rank_candidate_history.pop(0)
+
             if len(self.rank_candidate_history) == self.rank_persistence_window:
                 mode_rank = Counter(self.rank_candidate_history).most_common(1)[0][0]
                 rank_t = mode_rank
             else:
                 rank_t = self.rank_history[-1] if self.rank_history else 0
+
             self.rank_history.append(int(rank_t))
             self.rank_history.pop(0)
         else:
+            # Recovery mode: report current estimate without updating history
             rank_t = int(rank_candidate)
 
-        # Layer 4b: Spectral gap and conditioning
+        # === Layer 4b: Spectral gap and conditioning (scale-invariant) ===
         spectral_gap = 0.0
         gap_ratio = 1.0
         conditioning = 0.0
@@ -141,7 +173,10 @@ class Q64DomainEngine:
         if rank_t > 0 and rank_t < len(vals):
             lambda_r = vals[int(rank_t) - 1]
             lambda_r_plus_1 = vals[int(rank_t)]
+
             spectral_gap = lambda_r - lambda_r_plus_1
+
+            # Gap ratio with spectrum floor guard
             if lambda_r > self.SPECTRUM_FLOOR and lambda_r_plus_1 > self.SPECTRUM_FLOOR:
                 gap_ratio = lambda_r / (lambda_r_plus_1 + 1e-10)
                 conditioning = np.log(gap_ratio)
@@ -149,30 +184,40 @@ class Q64DomainEngine:
                 gap_ratio = 1.0
                 conditioning = 0.0
 
-        # Layer 5 & 6: PCA residual
+        # === Layer 5 & 6: PCA reconstruction residual (normalized by ||G||_F) ===
         G_k = U_k @ np.diag(Lambda_k) @ U_k.T
         R_t = np.linalg.norm(G - G_k, ord='fro')
+
+        # Normalize by total Gramian energy (not single eigenvalue)
         G_norm = np.linalg.norm(G, ord='fro') + self.RESIDUAL_SCALE_FLOOR
         R_t_normalized = R_t / G_norm
 
-        # Layer 7: Spectral energy
+        # === Layer 7: Spectral energy (stability of rank) ===
         spectral_energy = np.sum(Lambda_k ** 2)
         L_t = spectral_energy
 
-        # Layer 8: Convergence predicates
+        # === Layer 8: Convergence predicates ===
+        # cond1: residual bounded (normalized by total energy)
         cond1 = R_t_normalized < self.epsilon_R
+
+        # cond2: rank stable (bounded variability, within ±1 of median)
         median_rank = int(np.median(self.rank_history))
         rank_range = set(range(max(1, median_rank - 1), median_rank + 2))
         cond2 = all(r in rank_range for r in self.rank_history)
+
+        # cond3: spectral energy stable (symmetric normalized, scale-free)
         if L_t > 0 and self.L_prev > 0:
             energy_change = abs(L_t - self.L_prev) / max(L_t, self.L_prev, 1e-10)
             cond3 = energy_change < self.delta_L
         else:
             cond3 = True
+
+        # cond4: Davis-Kahan guard (eigenvalue gap sufficient for reliability)
         cond4 = conditioning > 0.1 if rank_t > 0 else True
 
         c_t = cond1 and cond2 and cond3 and cond4
 
+        # Record first convergence
         if c_t and not self.converged_ever:
             self.time_converged = self.frame_count
             self.converged_ever = True
@@ -181,19 +226,28 @@ class Q64DomainEngine:
             self.L_prev = L_t
 
         return DomainMetrics(
-            c_t=c_t, rank=int(rank_t), R_t=R_t, L_t=L_t,
-            rank_stable=cond2, drift_stable=cond3,
+            c_t=c_t,
+            rank=int(rank_t),
+            R_t=R_t,
+            L_t=L_t,
+            rank_stable=cond2,
+            drift_stable=cond3,
             time_converged=self.time_converged,
-            spectral_gap=spectral_gap, gap_ratio=gap_ratio, conditioning=conditioning
+            spectral_gap=spectral_gap,
+            gap_ratio=gap_ratio,
+            conditioning=conditioning
         )
 
     def update(self, s_t: np.ndarray) -> DomainMetrics:
         """Standard update path: window-based covariance analysis."""
         self.frame_count += 1
+
+        # Maintain sliding window
         self.window.append(s_t.copy())
         if len(self.window) > self.w:
             self.window.pop(0)
 
+        # Compute window covariance
         if len(self.window) < 2:
             return DomainMetrics(
                 c_t=False, rank=0, R_t=float('inf'), L_t=0.0,
@@ -207,8 +261,10 @@ class Q64DomainEngine:
         W_centered = W - mu
         self.G = (W_centered.T @ W_centered) / len(self.window)
 
+        # Analyze using shared method (with state updates, no warmup)
         metrics = self.analyze_gramian(self.G, s_t, update_state=True, warmup=False)
 
+        # Determine convergence state
         if metrics.c_t:
             self.convergence_state = "converged"
         elif self.ewma_recovery_mode:
@@ -218,6 +274,7 @@ class Q64DomainEngine:
 
         metrics.convergence_state = self.convergence_state
         metrics.speculative_confidence = 1.0
+
         return metrics
 
 
@@ -233,10 +290,12 @@ class RenderingDomainMill(Q64DomainEngine):
         self.ewma_alpha_normal = ewma_alpha_normal
         self.ewma_alpha_recovery = ewma_alpha_recovery
 
+        # Speculative state
         self.vecs_emitted = None
         self.prediction_error = 0.0
         self.rollback_count = 0
 
+        # Recovery EWMA state
         self.mu_ewma = None
         self.G_ewma = None
         self.recovery_mode_depth = 0
@@ -250,12 +309,14 @@ class RenderingDomainMill(Q64DomainEngine):
             self.mu_ewma = np.mean(W, axis=0) if len(W) > 0 else np.zeros(self.N)
             self.G_ewma = self.G.copy()
 
+        # Joint EWMA update (mean + covariance centered)
         self.mu_ewma = (self.ewma_alpha_recovery * self.mu_ewma +
                         (1 - self.ewma_alpha_recovery) * s_t)
         delta = s_t.reshape(-1, 1) - self.mu_ewma.reshape(-1, 1)
         self.G_ewma = (self.ewma_alpha_recovery * self.G_ewma +
                        (1 - self.ewma_alpha_recovery) * (delta @ delta.T))
 
+        # Spectral gap anchor on EWMA geometry
         try:
             vals, _ = np.linalg.eigh(self.G_ewma)
             vals = np.maximum(vals, 0.0)
@@ -269,6 +330,7 @@ class RenderingDomainMill(Q64DomainEngine):
         except np.linalg.LinAlgError:
             pass
 
+        # Enter recovery mode
         self.ewma_recovery_mode = True
         self.rollback_frame = self.frame_count
         self.tau_locked_until = self.frame_count + 15
@@ -277,53 +339,89 @@ class RenderingDomainMill(Q64DomainEngine):
         self.rollback_count += 1
 
     def principal_angle_max(self, U1: np.ndarray, U2: np.ndarray) -> float:
-        """Largest principal angle between subspaces (sign-invariant)."""
+        """Largest principal angle between subspaces (sign-invariant, conservative)."""
         try:
             _, sigma, _ = np.linalg.svd(U1.T @ U2, full_matrices=False)
             sigma = np.clip(sigma, -1.0, 1.0)
-            theta_max = np.arccos(sigma[-1])
+            theta_max = np.arccos(sigma[-1])  # Smallest singular value → largest angle
             error = theta_max / (np.pi / 2)
         except (np.linalg.LinAlgError, IndexError):
             error = 1.0
         return error
 
+    def grassmannian_distance(self, U1: np.ndarray, U2: np.ndarray) -> float:
+        """
+        Geodesic distance on Grassmannian manifold (manifold velocity).
+
+        Measures rate of subspace rotation: η_t = sqrt(Σ(1 - σ_i²))
+        where σ_i = singular values of U1^T @ U2 (cosines of principal angles)
+
+        Returns:
+            innovation ∈ [0, sqrt(k)] | manifold rotation rate
+            0 = identical subspaces (no change)
+            sqrt(k) = completely orthogonal (maximum rotation)
+        """
+        try:
+            _, sigma, _ = np.linalg.svd(U1.T @ U2, full_matrices=False)
+            sigma = np.clip(sigma, -1.0, 1.0)
+            # Grassmannian distance: sqrt(sum of squared sines of angles)
+            innovation = np.sqrt(np.sum(1 - sigma**2))
+        except (np.linalg.LinAlgError, IndexError):
+            innovation = np.sqrt(min(U1.shape[1], U2.shape[1]))
+        return innovation
+
     def update(self, s_t: np.ndarray) -> DomainMetrics:
         """Update with speculative dispatch."""
         self.frame_count += 1
 
+        # === Release τ lock if cooldown expired ===
         if self.frame_count > self.tau_locked_until and self.tau_locked_until >= 0:
             self.tau = self.tau_original
             self.tau_locked_until = -1
 
+        # === Window synchronization (always append, regardless of mode) ===
         self.window.append(s_t.copy())
         if len(self.window) > self.w:
             self.window.pop(0)
 
+        # === Conditional geometry: recovery vs. normal ===
         if self.ewma_recovery_mode:
+            # Recovery branch: use EWMA geometry
             self.recovery_mode_depth += 1
+
+            # Joint EWMA update (same as process_rollback)
             self.mu_ewma = (self.ewma_alpha_recovery * self.mu_ewma +
                             (1 - self.ewma_alpha_recovery) * s_t)
             delta = s_t.reshape(-1, 1) - self.mu_ewma.reshape(-1, 1)
             self.G_ewma = (self.ewma_alpha_recovery * self.G_ewma +
                            (1 - self.ewma_alpha_recovery) * (delta @ delta.T))
+
+            # Analyze EWMA geometry (no state contamination)
             metrics = self.analyze_gramian(self.G_ewma, s_t, update_state=False, warmup=False)
 
+            # Exit recovery after 5 frames
             if self.recovery_mode_depth > 5:
                 self.ewma_recovery_mode = False
                 self.mu_ewma = None
                 self.G_ewma = None
         else:
+            # Normal branch: use window covariance
             if len(self.window) < 2:
-                return DomainMetrics(c_t=False, rank=0, R_t=float('inf'), L_t=0.0,
-                                    rank_stable=False, drift_stable=False,
-                                    time_converged=-1, spectral_gap=0.0, gap_ratio=1.0,
-                                    conditioning=0.0)
+                return DomainMetrics(
+                    c_t=False, rank=0, R_t=float('inf'), L_t=0.0,
+                    rank_stable=False, drift_stable=False,
+                    time_converged=-1, spectral_gap=0.0, gap_ratio=1.0,
+                    conditioning=0.0)
+
             W = np.array(self.window)
             mu = np.mean(W, axis=0)
             W_centered = W - mu
             self.G = (W_centered.T @ W_centered) / len(self.window)
+
+            # Analyze window geometry (with state updates)
             metrics = self.analyze_gramian(self.G, s_t, update_state=True, warmup=False)
 
+        # === Extract eigenvectors for validation ===
         vecs_new = None
         if len(self.window) >= 2:
             try:
@@ -336,18 +434,28 @@ class RenderingDomainMill(Q64DomainEngine):
             except:
                 vecs_new = None
 
+        # === Validate prediction (only in normal mode, after warm-up) ===
         prediction_error = 0.0
+        innovation = 0.0
         rollback = False
+
+        # Compute manifold velocity (Grassmannian distance) whenever eigenvectors available
+        if vecs_new is not None and self.vecs_emitted is not None:
+            innovation = self.grassmannian_distance(self.vecs_emitted, vecs_new)
 
         if self.frame_count > 30 and not self.ewma_recovery_mode:
             if vecs_new is not None and self.vecs_emitted is not None:
+                # Principal angle metric (sign-invariant)
                 prediction_error = self.principal_angle_max(self.vecs_emitted, vecs_new)
+
                 if prediction_error > self.prediction_threshold:
                     rollback = True
                     self.process_rollback(s_t)
 
+        # === Store for next frame speculation ===
         self.vecs_emitted = vecs_new if vecs_new is not None else self.vecs_emitted
 
+        # === Determine convergence state ===
         if rollback or self.ewma_recovery_mode:
             convergence_state = "speculative"
         elif metrics.c_t:
@@ -355,6 +463,7 @@ class RenderingDomainMill(Q64DomainEngine):
         else:
             convergence_state = "diverged"
 
+        # === Track speculative duration for confidence decay ===
         if convergence_state == "speculative":
             self.speculative_frame_count += 1
         else:
@@ -362,22 +471,24 @@ class RenderingDomainMill(Q64DomainEngine):
 
         speculative_confidence = np.exp(-self.speculative_frame_count / self.speculative_budget_frames)
 
+        # === Return metrics with rendering-specific fields ===
         metrics.prediction_error = prediction_error
         metrics.rollback = rollback
         metrics.convergence_state = convergence_state
         metrics.speculative_confidence = speculative_confidence
+        metrics.innovation = innovation
 
         return metrics
 
 
 class Q64StratifiedEngine:
-    """Multi-domain Q64 engine with per-domain convergence tracking and graduated H1 gate"""
+    """Multi-domain Q64 engine with per-domain convergence tracking and graduated H₁ gate"""
 
     EWMA_ALPHA_RECOVERY_MAP = {
-        "rendering": 0.80,
-        "physics": 0.60,
-        "system": 0.50,
-        "input": 0.70,
+        "rendering": 0.80,  # Visual coherence: instant adaptation
+        "physics": 0.60,    # Momentum preservation: smooth blend
+        "system": 0.50,     # Hardware baseline: conservative
+        "input": 0.70,      # Control inputs: responsive
     }
 
     def __init__(self, rendering_speculative: bool = True, prediction_threshold: float = 0.15):
@@ -429,7 +540,14 @@ class Q64StratifiedEngine:
         return {d: engine.converged_ever for d, engine in self.domains.items()}
 
     def h1_gate_evaluation(self) -> Tuple[str, float, Dict]:
-        """Graduated H1 Gate with Confidence Weighting and Speculative Decay."""
+        """
+        Graduated H₁ Gate with Confidence Weighting and Speculative Decay.
+
+        Returns (status, confidence, detail):
+        - status ∈ {"green", "yellow", "orange", "red"}
+        - confidence ∈ [0.0, 1.0] scaled monotonically by domain quality
+        - detail: per-domain and aggregate metrics
+        """
         detail = {}
         domains_converged = 0
         domains_speculative_weighted = 0.0
@@ -446,13 +564,21 @@ class Q64StratifiedEngine:
             metrics_list = self.metrics_history[domain_name]
             latest_metric = metrics_list[-1]
 
+            # Count convergence states
             converged_count = sum(1 for m in metrics_list if m.convergence_state == "converged")
             speculative_count = sum(1 for m in metrics_list if m.convergence_state == "speculative")
 
             pct_converged = converged_count / len(metrics_list) if metrics_list else 0.0
             pct_speculative = speculative_count / len(metrics_list) if metrics_list else 0.0
 
-            thresholds = {"input": 0.80, "physics": 0.70, "system": 0.60, "rendering": 0.40}
+            # Domain-specific thresholds
+            thresholds = {
+                "input": 0.80,      # Input: rock-solid control
+                "physics": 0.70,    # Physics: stable motion tracking
+                "system": 0.60,     # System: hardware baseline
+                "rendering": 0.40,  # Rendering: most complex, lower bar
+            }
+
             threshold = thresholds.get(domain_name, 0.5)
             passes_converged = pct_converged >= threshold
 
@@ -460,6 +586,7 @@ class Q64StratifiedEngine:
                 domains_converged += 1
                 status = "converged"
             elif pct_speculative > 0:
+                # Weight by recency and age (confidence decay)
                 domains_speculative_weighted += latest_metric.speculative_confidence
                 status = "recovering"
             else:
@@ -470,14 +597,18 @@ class Q64StratifiedEngine:
                 "pct_converged": pct_converged,
                 "pct_speculative": pct_speculative,
                 "threshold": threshold,
-                "latest_confidence": latest_metric.speculative_confidence
+                "latest_confidence": latest_metric.speculative_confidence,
+                "innovation": latest_metric.innovation
             }
 
+        # === Gate decision with monotonic confidence scaling ===
         if domains_converged >= 3:
             gate_status = "green"
             confidence = 1.0
         elif domains_converged == 2 and domains_speculative_weighted >= 0.7:
             gate_status = "yellow"
+            # Confidence between orange (0.4) and green (1.0)
+            # Scale speculative weight into [0.4, 0.7] range monotonically
             normalized_speculative = min(1.0, domains_speculative_weighted / 2.0)
             confidence = 0.4 + 0.3 * normalized_speculative
         elif domains_converged == 2:
